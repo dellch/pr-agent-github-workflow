@@ -1,0 +1,26 @@
+[config]
+publish_output_progress = false
+restricted_mode = true
+
+[pr_reviewer]
+final_update_message = false
+extra_instructions = """
+Focus on defects, security, tenant isolation, auth, async/database performance, API/frontend contract mismatches, missing migrations, and missing tests.
+For backend changes, check GMM Nexus conventions: async sessions, PolicyRepository for policy CRUD, core exceptions, validated schemas, and no load-all-then-filter or N+1 patterns.
+For frontend changes, check GMM Nexus conventions: TanStack Query hooks, apiFetch/apiUpload, useWorkspace, feature gates, and stable UI behavior.
+Keep findings concise and actionable. Avoid broad praise and style-only comments unless they affect maintainability or correctness.
+"""
+
+[pr_description]
+final_update_message = false
+generate_ai_title = false
+
+[pr_code_suggestions]
+publish_output_no_suggestions = false
+commitable_code_suggestions = true
+suggestions_score_threshold = 7
+focus_only_on_problems = true
+max_number_of_calls = 3
+
+[pr_update_changelog]
+push_changelog_changes = false

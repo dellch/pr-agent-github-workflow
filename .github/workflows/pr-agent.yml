@@ -1,0 +1,190 @@
+# =============================================================================
+# Runs PR-Agent (https://github.com/The-PR-Agent/pr-agent) review and improve
+# on pull requests, and responds to PR comment commands.
+#
+# The PR-Agent container image is pinned by SHA-256 digest and its GitHub
+# artifact attestation is verified before execution.
+#
+# To upgrade PR-Agent, update PR_AGENT_IMAGE below to the desired
+# "<version>-github_action@sha256:<digest>" image reference. The attestation
+# verification step derives the digest from that value, so no other digest
+# needs to be updated.
+# =============================================================================
+
+name: PR Agent
+
+on:
+  pull_request:
+    types: [opened, reopened, ready_for_review, synchronize]
+  issue_comment:
+    types: [created, edited]
+  pull_request_review_comment:
+    types: [created, edited]
+
+permissions:
+  attestations: read
+  contents: read
+  issues: write
+  pull-requests: write
+
+env:
+  PR_AGENT_IMAGE: pragent/pr-agent:0.46.0-github_action@sha256:65e5b196e38cecd7df8a71fe29942052e081a0c6645132c2ac874df60b1760c7
+
+  PR_AGENT_AUTO_REVIEW: "true"    # Auto-run the review tool: https://docs.pr-agent.ai/tools/review
+  PR_AGENT_AUTO_DESCRIBE: "false" # Auto-run the describe tool: https://docs.pr-agent.ai/tools/describe
+  PR_AGENT_AUTO_IMPROVE: "true"   # Auto-run the improve tool: https://docs.pr-agent.ai/tools/improve
+
+  # Keep in sync with on.pull_request.types above.
+  PR_AGENT_PR_ACTIONS: '["opened","reopened","ready_for_review","synchronize"]'
+
+concurrency:
+  group: pr-agent-${{ github.event_name }}-${{ github.event.pull_request.number || github.event.issue.number || github.run_id }}-${{ (github.event_name == 'issue_comment' || github.event_name == 'pull_request_review_comment') && github.event.comment.id || 'auto' }}
+  cancel-in-progress: true
+
+jobs:
+  pr-agent:
+    name: PR Agent
+
+    # Ignore bot events and only allow PR comment commands from trusted
+    # repository participants.
+    if: >-
+      ${{
+        github.event.sender.type != 'Bot' &&
+        (
+          github.event_name == 'pull_request' ||
+          github.event.issue.pull_request ||
+          github.event.comment.pull_request_url
+        ) &&
+        (
+          github.event_name == 'pull_request' ||
+          (
+            startsWith(github.event.comment.body, '/') &&
+            (
+              github.event.comment.author_association == 'OWNER' ||
+              github.event.comment.author_association == 'MEMBER' ||
+              github.event.comment.author_association == 'COLLABORATOR'
+            )
+          )
+        )
+      }}
+
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check required configuration
+        id: config
+        env:
+          OPENAI_KEY: ${{ secrets.OPENAI_KEY }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${OPENAI_KEY}" ]; then
+            echo "configured=false" >> "${GITHUB_OUTPUT}"
+            echo "Not running PR-Agent because OPENAI_KEY secret is not set."
+
+            {
+              echo "## PR-Agent"
+              echo
+              echo "Not run because \`OPENAI_KEY\` is not set."
+            } >> "${GITHUB_STEP_SUMMARY}"
+
+            exit 0
+          fi
+
+          echo "configured=true" >> "${GITHUB_OUTPUT}"
+
+      - name: Verify PR-Agent image attestation
+        if: ${{ steps.config.outputs.configured == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          if [[ ! "${PR_AGENT_IMAGE}" =~ ^pragent/pr-agent:[0-9][0-9A-Za-z._-]*-github_action@sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::PR_AGENT_IMAGE must pin a pragent/pr-agent github_action image by sha256 digest."
+            exit 1
+          fi
+
+          digest="${PR_AGENT_IMAGE##*@}"
+          image_ref="index.docker.io/pragent/pr-agent"
+
+          gh attestation verify "oci://${image_ref}@${digest}" \
+            --repo The-PR-Agent/pr-agent \
+            --predicate-type https://slsa.dev/provenance/v1 \
+            --cert-identity-regex '^https://github\.com/The-PR-Agent/pr-agent/\.github/workflows/publish\.yml@refs/(heads/main|tags/v?[0-9][0-9A-Za-z._-]*)$' \
+            --cert-oidc-issuer https://token.actions.githubusercontent.com \
+            --deny-self-hosted-runners
+
+      # Do not pass secrets to PR-Agent for pull requests originating from forks.
+      - name: Check PR is not from a fork
+        id: pr-source
+        if: ${{ steps.config.outputs.configured == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR_NUMBER: ${{ github.event.pull_request.number || github.event.issue.number }}
+          PR_HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name || '' }}
+          BASE_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          head_repo="${PR_HEAD_REPO}"
+          base_repo="${BASE_REPO}"
+
+          if [ "${EVENT_NAME}" != "pull_request" ]; then
+            head_repo="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" --jq ".head.repo.full_name")"
+            base_repo="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" --jq ".base.repo.full_name")"
+          fi
+
+          if [ "${head_repo}" != "${base_repo}" ]; then
+            echo "run_pr_agent=false" >> "${GITHUB_OUTPUT}"
+            echo "Skipping PR-Agent for forked PR from ${head_repo}."
+            exit 0
+          fi
+
+          echo "run_pr_agent=true" >> "${GITHUB_OUTPUT}"
+
+      - name: Run PR-Agent
+        if: >-
+          ${{
+            steps.config.outputs.configured == 'true' &&
+            steps.pr-source.outputs.run_pr_agent == 'true'
+          }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OPENAI_KEY: ${{ secrets.OPENAI_KEY }}
+        run: |
+          set -euo pipefail
+
+          docker run --rm \
+            --volume "${GITHUB_EVENT_PATH}:/github_event/event.json:ro" \
+            --volume "${GITHUB_WORKSPACE}:/github/workspace:ro" \
+            --env CI=true \
+            --env GITHUB_ACTIONS=true \
+            --env GITHUB_ACTION \
+            --env GITHUB_ACTION_REPOSITORY \
+            --env GITHUB_ACTOR \
+            --env GITHUB_API_URL \
+            --env GITHUB_BASE_REF \
+            --env GITHUB_EVENT_NAME \
+            --env GITHUB_EVENT_PATH=/github_event/event.json \
+            --env GITHUB_GRAPHQL_URL \
+            --env GITHUB_HEAD_REF \
+            --env GITHUB_OUTPUT=/tmp/pr_agent_github_output \
+            --env GITHUB_REF \
+            --env GITHUB_REPOSITORY \
+            --env GITHUB_RUN_ATTEMPT \
+            --env GITHUB_RUN_ID \
+            --env GITHUB_RUN_NUMBER \
+            --env GITHUB_SERVER_URL \
+            --env GITHUB_SHA \
+            --env GITHUB_TOKEN \
+            --env GITHUB_WORKFLOW \
+            --env GITHUB_WORKSPACE=/github/workspace \
+            --env OPENAI_KEY \
+            --env "github_action_config.auto_review=${PR_AGENT_AUTO_REVIEW}" \
+            --env "github_action_config.auto_describe=${PR_AGENT_AUTO_DESCRIBE}" \
+            --env "github_action_config.auto_improve=${PR_AGENT_AUTO_IMPROVE}" \
+            --env "github_action_config.pr_actions=${PR_AGENT_PR_ACTIONS}" \
+            "${PR_AGENT_IMAGE}"
